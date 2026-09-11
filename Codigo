@@ -1,0 +1,143 @@
+// SIGET - Productor-Consumidor: sensores de trafico -> analisis
+// Se usan hilos y funciones de sincronizacion del sistema operativo
+// (CreateThread, CreateSemaphore, CRITICAL_SECTION).
+//
+// Tareas diferenciadas:
+//  - Sensor de FLUJO: mide vehiculos/minuto de forma constante y frecuente.
+//  - Sensor de INCIDENTES (camara): revisa con menor frecuencia pero reporta
+//    severidad de posibles accidentes (valores altos y esporadicos).
+//  - Analisis de TENDENCIA: calcula un promedio movil del flujo para decidir
+//    si el trafico esta empeorando (calculo acumulativo, tarea liviana).
+//  - Analisis de ALERTAS: cuando llega un dato critico, simula el tiempo de
+//    procesamiento de una alerta real (tarea mas pesada) y lleva la cuenta
+//    de alertas emitidas.
+
+#include <windows.h>
+#include <iostream>
+#include <cstdlib>
+#include <ctime>
+using namespace std;
+
+const int TAM = 6, LECTURAS_POR_SENSOR = 12, SENSORES = 2, ANALIZADORES = 2;
+const int TIPO_FLUJO = 0, TIPO_INCIDENTE = 1;
+
+struct Lectura { int tipo; int valor; };
+
+Lectura buffer[TAM];
+int inicio = 0, fin = 0;
+int alertasGeneradas = 0;   // recurso compartido adicional -> tambien protegido
+
+HANDLE semEspacios, semDatos;
+CRITICAL_SECTION mutexBuffer, mutexAlertas;
+
+// ---- Productores -----------------------------------------------------
+DWORD WINAPI sensorFlujo(LPVOID) {
+    for (int i = 0; i < LECTURAS_POR_SENSOR; i++) {
+        Lectura l{ TIPO_FLUJO, rand() % 100 }; // vehiculos detectados
+
+        WaitForSingleObject(semEspacios, INFINITE);
+        EnterCriticalSection(&mutexBuffer);
+        buffer[fin] = l;
+        fin = (fin + 1) % TAM;
+        cout << "[Sensor flujo] vehiculos: " << l.valor << endl;
+        LeaveCriticalSection(&mutexBuffer);
+        ReleaseSemaphore(semDatos, 1, NULL);
+
+        Sleep(rand() % 200 + 100); // lecturas frecuentes
+    }
+    return 0;
+}
+
+DWORD WINAPI sensorIncidente(LPVOID) {
+    for (int i = 0; i < LECTURAS_POR_SENSOR / 2; i++) {
+        // simula que la mayoria de revisiones no detectan nada grave
+        int severidad = (rand() % 4 == 0) ? (70 + rand() % 30) : (rand() % 40);
+        Lectura l{ TIPO_INCIDENTE, severidad };
+
+        WaitForSingleObject(semEspacios, INFINITE);
+        EnterCriticalSection(&mutexBuffer);
+        buffer[fin] = l;
+        fin = (fin + 1) % TAM;
+        cout << "[Sensor camara] severidad: " << l.valor << endl;
+        LeaveCriticalSection(&mutexBuffer);
+        ReleaseSemaphore(semDatos, 1, NULL);
+
+        Sleep(rand() % 500 + 300); // revisiones menos frecuentes
+    }
+    return 0;
+}
+
+// ---- Consumidores ------------------------------------------------------
+DWORD WINAPI analisisTendencia(LPVOID) {
+    int suma = 0, n = 0;
+    int total = (LECTURAS_POR_SENSOR + LECTURAS_POR_SENSOR / 2) / ANALIZADORES;
+
+    for (int i = 0; i < total; i++) {
+        WaitForSingleObject(semDatos, INFINITE);
+        EnterCriticalSection(&mutexBuffer);
+        Lectura l = buffer[inicio];
+        inicio = (inicio + 1) % TAM;
+        LeaveCriticalSection(&mutexBuffer);
+        ReleaseSemaphore(semEspacios, 1, NULL);
+
+        if (l.tipo == TIPO_FLUJO) {
+            suma += l.valor; n++;
+            cout << "    [Tendencia] promedio movil: " << (suma / n) << endl;
+        } else {
+            cout << "    [Tendencia] dato de incidente ignorado (no aplica a promedio)" << endl;
+        }
+        Sleep(rand() % 150 + 50); // calculo liviano
+    }
+    return 0;
+}
+
+DWORD WINAPI analisisAlertas(LPVOID) {
+    int total = (LECTURAS_POR_SENSOR + LECTURAS_POR_SENSOR / 2) / ANALIZADORES;
+
+    for (int i = 0; i < total; i++) {
+        WaitForSingleObject(semDatos, INFINITE);
+        EnterCriticalSection(&mutexBuffer);
+        Lectura l = buffer[inicio];
+        inicio = (inicio + 1) % TAM;
+        LeaveCriticalSection(&mutexBuffer);
+        ReleaseSemaphore(semEspacios, 1, NULL);
+
+        bool esCritico = (l.tipo == TIPO_INCIDENTE && l.valor >= 70) ||
+                          (l.tipo == TIPO_FLUJO && l.valor >= 90);
+        if (esCritico) {
+            Sleep(400); // simula el tiempo de despachar una alerta real
+            EnterCriticalSection(&mutexAlertas);
+            alertasGeneradas++;
+            cout << "    [Alertas] !! alerta despachada (total: " << alertasGeneradas << ")" << endl;
+            LeaveCriticalSection(&mutexAlertas);
+        } else {
+            cout << "    [Alertas] dato dentro de rango normal" << endl;
+        }
+        Sleep(rand() % 100 + 50);
+    }
+    return 0;
+}
+
+int main() {
+    srand((unsigned)time(NULL));
+    InitializeCriticalSection(&mutexBuffer);
+    InitializeCriticalSection(&mutexAlertas);
+    semEspacios = CreateSemaphore(NULL, TAM, TAM, NULL);
+    semDatos = CreateSemaphore(NULL, 0, TAM * SENSORES, NULL);
+
+    HANDLE h[4];
+    h[0] = CreateThread(NULL, 0, sensorFlujo, NULL, 0, NULL);
+    h[1] = CreateThread(NULL, 0, sensorIncidente, NULL, 0, NULL);
+    h[2] = CreateThread(NULL, 0, analisisTendencia, NULL, 0, NULL);
+    h[3] = CreateThread(NULL, 0, analisisAlertas, NULL, 0, NULL);
+
+    WaitForMultipleObjects(4, h, TRUE, INFINITE);
+    for (int i = 0; i < 4; i++) CloseHandle(h[i]);
+    CloseHandle(semEspacios);
+    CloseHandle(semDatos);
+    DeleteCriticalSection(&mutexBuffer);
+    DeleteCriticalSection(&mutexAlertas);
+
+    cout << endl << "=== Simulacion finalizada. Alertas totales: " << alertasGeneradas << " ===" << endl;
+    return 0;
+}
